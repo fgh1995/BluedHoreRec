@@ -90,6 +90,7 @@ def setup_treeview_sorting(tree):
 
 class WebSocketClientApp:
     def __init__(self, root):
+        self.result = None
         self.final_text = None
         self.rec_final_text = None
         self.root = root
@@ -183,9 +184,9 @@ class WebSocketClientApp:
                 try:
                     response = requests.get("http://localhost:8088/api/", params=params, timeout=3)
                     if response.status_code == 200:
-                        print(f'vMix更新成功: {response.text}')
+                        print(f'vMix更新成功: 退出直播间消息-{response.text}')
                 except Exception as e:
-                    print(f'vMix API调用失败: {e}')
+                    print(f'vMix API调用失败: 退出直播间消息-{e}')
 
             # 立即更新
             self.thread_pool.submit(update_vmix_text, msg_extra)
@@ -193,7 +194,7 @@ class WebSocketClientApp:
             # 延迟恢复
             def delayed_reset():
                 time.sleep(7.0)
-                self.thread_pool.submit(update_vmix_text, "欢迎来到玖郎185直播间")
+                self.thread_pool.submit(update_vmix_text, "欢迎来到水族小宇的直播间")
 
             self.thread_pool.submit(delayed_reset)
 
@@ -381,12 +382,27 @@ class WebSocketClientApp:
                     if any(any(f_item in str(val).lower() for val in values)
                            for f_item in filter_items):
                         filtered_data.append((values, tags))
-
+                # 提取第6个项（倍数）并转换为整数
+                multiples = [int(item[0][5]) for item in filtered_data]
+                # 找到最大的倍数
+                max_multiple = max(multiples)
+                # 找到对应的记录
+                max_records = [item for item in filtered_data if int(item[0][5]) == max_multiple]
+                print("最大的倍数是:", max_multiple)
+                print("对应的记录是:")
+                for record in max_records:
+                    # 提取关键字段
+                    time = record[0][0].split()[1]  # 提取时间部分 "21:10:11"
+                    anchor_name = record[0][2]  # "90岁风韵犹存你太奶"
+                    gift_name = record[0][3]  # "幸运魔镜"
+                    multiple = record[0][5]  # "1000"
+                    beans = record[0][4]  # "36000"
+                    # 拼接成目标文本
+                    self.result = f"近期最大出奖 {time} {anchor_name} 抽出 {gift_name} {multiple} 倍 共 {beans} 豆。   "
                 # 准备输出文本
-                items_to_output = filtered_data[-10:] if len(filtered_data) > 10 else filtered_data
+                items_to_output = filtered_data[-3:] if len(filtered_data) > 3 else filtered_data
                 items_to_output.reverse()
-
-                final_text = ""
+                final_text = self.result
                 for values, _ in items_to_output:
                     time_str = values[0]
                     username = values[2]
@@ -395,8 +411,8 @@ class WebSocketClientApp:
                     multiplier = values[5]
                     formatted_time = time_str.split(" ")[1]
 
-                    line = (f"{formatted_time} [{filter_text}]\n{username}\n"
-                            f"抽中 {multiplier} 倍 {gift}\n获得 {beans} 豆\n\n")
+                    line = (f"{formatted_time} [{filter_text}] {username} "
+                            f"抽中 {multiplier} 倍 {gift}，获得 {beans} 豆。   ")
                     final_text += line
 
                 # 更新UI
@@ -422,8 +438,8 @@ class WebSocketClientApp:
         """更新vMix文本的专用方法"""
         params = {
             "Function": "SetText",
-            "Input": "居中滚动字幕",
-            "SelectedName": "滚动字幕1.Text",
+            "Input": "动态滚动1",
+            "SelectedName": "Ticker.Text",
             "Value": text
         }
         try:
