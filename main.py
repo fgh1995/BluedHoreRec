@@ -1,5 +1,4 @@
 import os
-
 import requests
 from autobahn.asyncio.websocket import WebSocketClientProtocol, WebSocketClientFactory
 import asyncio
@@ -11,6 +10,10 @@ from txaio import make_logger
 from threading import Timer
 from apscheduler.schedulers.background import BackgroundScheduler
 import datetime
+import concurrent.futures
+import queue
+import time
+from functools import partial
 
 import models
 
@@ -34,12 +37,12 @@ class MyClientProtocol(WebSocketClientProtocol):
 
     def onConnect(self, response):
         if self.app:
-            self.app.root.after(0, self.app.update_status, f"正在连接: {response.peer}")
+            self.app.safe_ui_update(self.app.update_status, f"正在连接: {response.peer}")
 
     def onOpen(self):
         if self.app:
             self.app.protocol = self  # 保存协议引用
-            self.app.root.after(0, self.app.connection_success)
+            self.app.safe_ui_update(self.app.connection_success)
 
     def onMessage(self, payload, isBinary):
         if not self.app:
@@ -48,66 +51,13 @@ class MyClientProtocol(WebSocketClientProtocol):
         if isBinary:
             message = f"二进制消息 ({len(payload)} bytes)"
         else:
-            message = payload.decode('utf8')
-            # 解析 JSON
-            data = json.loads(message)
-
-            # 提取主要信息
-            msg_type = data.get("msgType")
-            msg_extra = data.get("msgExtra", {})
-            print(f"消息类型: {msg_type}")
-            match msg_type:
-                case 28:
-                    try:
-                        # 如果已经存在计时器，先取消它
-                        if hasattr(self, 'lucky_gift_timer') and self.lucky_gift_timer:
-                            self.lucky_gift_timer.cancel()
-                        url = "http://localhost:8088/api/"
-                        params = {
-                            "Function": "SetText",
-                            "Input": "退出直播间消息",  # 替换成你的 vMix 输入名
-                            "SelectedName": "Text-Title.Text",
-                            "Value": msg_extra  # 使用编码后的文本
-                        }
-                        response = requests.get(url, params=params)
-                        if response.status_code == 200:
-                            print(f'退出直播间消息：{response.text}')  # 查看 vMix 返回的响应
-
-                        def write_lucky_gift():
-                            url = "http://localhost:8088/api/"
-                            params = {
-                                "Function": "SetText",
-                                "Input": "退出直播间消息",  # 替换成你的 vMix 输入名
-                                "SelectedName": "Text-Title.Text",
-                                "Value": "欢迎来到玖郎185直播间"  # 使用编码后的文本
-                            }
-                            response = requests.get(url, params=params)
-                            if response.status_code == 200:
-                                print(f'退出直播间消息：{response.text}')
-                            if hasattr(self, 'lucky_gift_timer'):
-                                del self.lucky_gift_timer
-
-                        # 创建新的计时器并保存引用
-                        self.lucky_gift_timer = Timer(7.0, write_lucky_gift)
-                        self.lucky_gift_timer.start()
-
-                    except Exception as e:
-                        print(f"写入文件时出错: {e}")
-                case 1995:
-                    self.app.root.after(0, self.app.display_message, "接收", "收到同步数据")
-                    if msg_extra.get("msgType") == "lotteryRecords":
-                        records = msg_extra.get("msgExtra", {})
-                        self.app.root.after(0, self.app.process_records, records)
-                case 233:
-                    self.app.root.after(0, self.app.display_message, "接收",
-                                        models.LiveMessageParser.convert_special_message(msg_extra))
-                case _:
-                    self.app.root.after(0, self.app.display_message, "接收", msg_extra)
+            # 将消息处理交给线程池
+            self.app.thread_pool.submit(self.app.process_message, payload)
 
     def onClose(self, wasClean, code, reason):
         if self.app:
-            self.app.root.after(0, self.app.update_status, f"连接关闭: {reason} (code: {code})")
-            self.app.root.after(0, self.app.reset_connection)
+            self.app.safe_ui_update(self.app.update_status, f"连接关闭: {reason} (code: {code})")
+            self.app.safe_ui_update(self.app.reset_connection)
 
 
 def setup_treeview_sorting(tree):
@@ -156,6 +106,15 @@ class WebSocketClientApp:
         self.current_records = {}  # 当前显示的记录
         self.auto_analyze = True  # 自动分析标志
 
+        # 创建线程池 (4个工作线程)
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+        # 创建消息队列用于线程间通信
+        self.message_queue = queue.Queue()
+
+        # 定期检查消息队列
+        self.root.after(100, self.process_pending_messages)
+
         # 创建顶部控制面板
         self.create_control_panel()
 
@@ -168,6 +127,78 @@ class WebSocketClientApp:
 
         # 创建数据分析标签页
         self.create_analysis_tab()
+
+    def process_pending_messages(self):
+        """处理来自后台线程的UI更新请求"""
+        try:
+            while True:
+                # 非阻塞获取消息
+                callback, args = self.message_queue.get_nowait()
+                callback(*args)
+        except queue.Empty:
+            pass
+        finally:
+            # 继续定期检查
+            self.root.after(100, self.process_pending_messages)
+
+    def safe_ui_update(self, callback, *args):
+        """安全地在UI线程中执行回调"""
+        self.message_queue.put((callback, args))
+
+    def process_message(self, payload):
+        """在后台线程中处理消息"""
+        try:
+            message = payload.decode('utf8')
+            data = json.loads(message)
+            msg_type = data.get("msgType")
+            msg_extra = data.get("msgExtra", {})
+
+            # 根据消息类型处理
+            if msg_type == 28:
+                self.handle_exit_message(msg_extra)
+            elif msg_type == 1995:
+                self.safe_ui_update(self.display_message, "接收", "收到同步数据")
+                if msg_extra.get("msgType") == "lotteryRecords":
+                    records = msg_extra.get("msgExtra", {})
+                    self.safe_ui_update(self.process_records, records)
+            elif msg_type == 233:
+                parsed_msg = models.LiveMessageParser.convert_special_message(msg_extra)
+                self.safe_ui_update(self.display_message, "接收", parsed_msg)
+            else:
+                self.safe_ui_update(self.display_message, "接收", msg_extra)
+        except Exception as e:
+            print(f"消息处理出错: {e}")
+
+    def handle_exit_message(self, msg_extra):
+        """处理退出消息"""
+        try:
+            # 发送到vMix的操作放到线程池
+            def update_vmix_text(text):
+                params = {
+                    "Function": "SetText",
+                    "Input": "退出直播间消息",
+                    "SelectedName": "Text-Title.Text",
+                    "Value": text
+                }
+                try:
+                    response = requests.get("http://localhost:8088/api/", params=params, timeout=3)
+                    if response.status_code == 200:
+                        print(f'vMix更新成功: {response.text}')
+                except Exception as e:
+                    print(f'vMix API调用失败: {e}')
+
+            # 立即更新
+            self.thread_pool.submit(update_vmix_text, msg_extra)
+
+            # 延迟恢复
+            def delayed_reset():
+                time.sleep(7.0)
+                self.thread_pool.submit(update_vmix_text, "欢迎来到玖郎185直播间")
+
+            self.thread_pool.submit(delayed_reset)
+
+        except Exception as e:
+            print(f"处理退出消息出错: {e}")
 
     def create_control_panel(self):
         """创建顶部控制面板"""
@@ -328,72 +359,79 @@ class WebSocketClientApp:
         result_frame.grid_columnconfigure(0, weight=1)
 
     def filter_treeview(self, *args):
-        """
-        过滤树状视图并将结果写入文件（记录倒序写入）
-        """
+        """优化后的过滤方法"""
         filter_text = self.filter_var.get().lower()
-        output_lines = []  # 用于存储格式化后的输出行
-        all_matched_items = []  # 存储所有匹配的项
-        self.original_data = []
+        filter_items = [item.strip() for item in filter_text.split('|')]
 
-        # 保存原始数据
-        for item in self.result_tree.get_children():
-            self.original_data.append({
-                "values": self.result_tree.item(item, "values"),
-                "tags": self.result_tree.item(item, "tags")
-            })
+        # 在后台线程中执行过滤和准备数据
+        def do_filter():
+            try:
+                # 准备数据
+                all_matched_items = []
+                output_lines = []
 
-        # 1. 先清空 Treeview
-        self.result_tree.delete(*self.result_tree.get_children())
+                # 获取当前所有项
+                all_items = [(self.result_tree.item(item, "values"),
+                              self.result_tree.item(item, "tags"))
+                             for item in self.result_tree.get_children()]
 
-        # 2. 重新插入匹配的项
-        for item in self.original_data:
-            if any(filter_text in str(val).lower() for val in item["values"]):
-                new_item = self.result_tree.insert(
-                    "",
-                    "end",
-                    values=item["values"],
-                    tags=item.get("tags", [])
-                )
-                all_matched_items.append(new_item)
+                # 过滤数据
+                filtered_data = []
+                for values, tags in all_items:
+                    if any(any(f_item in str(val).lower() for val in values)
+                           for f_item in filter_items):
+                        filtered_data.append((values, tags))
 
-        # 3. 处理输出数据（从 start_line 开始）
-        treeCount = len(self.result_tree.get_children())
-        start_line = treeCount - 10 if treeCount > 10 else 0
+                # 准备输出文本
+                items_to_output = filtered_data[-10:] if len(filtered_data) > 10 else filtered_data
+                items_to_output.reverse()
 
-        # 获取要输出的项（注意这里已经是从后往前取了）
-        items_to_output = all_matched_items[start_line:]
+                final_text = ""
+                for values, _ in items_to_output:
+                    time_str = values[0]
+                    username = values[2]
+                    gift = values[3]
+                    beans = values[4]
+                    multiplier = values[5]
+                    formatted_time = time_str.split(" ")[1]
 
-        # 反转顺序，使最早的记录先写入文件
-        items_to_output.reverse()
-        all_lines = []  # 存储所有行的列表
-        for item in items_to_output:
-            values = self.result_tree.item(item, "values")
-            time_str = values[0]  # 第一列是时间
-            username = values[2]  # 第三列是用户名
-            gift = values[3]  # 第四列是礼物名
-            beans = values[4]  # 第五列是豆数
-            multiplier = values[5]  # 第六列是倍数
-            formatted_time = time_str.split(" ")[1]  # 只取时间部分
+                    line = (f"{formatted_time} [{filter_text}]\n{username}\n"
+                            f"抽中 {multiplier} 倍 {gift}\n获得 {beans} 豆\n\n")
+                    final_text += line
 
-            line = f"{formatted_time} [{filter_text}]\n{username}\n抽中 {multiplier} 倍 {gift}\n获得 {beans} 豆\n\n"
-            all_lines.append(line)  # 添加到列表
+                # 更新UI
+                def update_ui():
+                    # 清空并重新插入过滤后的项
+                    self.result_tree.delete(*self.result_tree.get_children())
+                    for i, (values, tags) in enumerate(filtered_data):
+                        self.result_tree.insert("", "end", values=values, tags=tags)
 
-            # 用 "\n" 拼接所有行
-            self.final_text = "".join(all_lines)  # 所有行合并成一个字符串
-        if self.rec_final_text != self.final_text:
-            self.rec_final_text = self.final_text
-            # 发送到 vMix API
-            url = "http://localhost:8088/api/"
-            params = {
-                "Function": "SetText",
-                "Input": "居中滚动字幕",  # 替换成你的 vMix 输入名
-                "SelectedName": "滚动字幕1.Text",
-                "Value": self.final_text  # 使用编码后的文本
-            }
-            response = requests.get(url, params=params)
+                    # 更新vMix
+                    if hasattr(self, 'rec_final_text') and self.rec_final_text != final_text:
+                        self.rec_final_text = final_text
+                        self.thread_pool.submit(self.update_vmix_text, final_text)
+
+                self.safe_ui_update(update_ui)
+
+            except Exception as e:
+                print(f"过滤出错: {e}")
+
+        self.thread_pool.submit(do_filter)
+
+    def update_vmix_text(self, text):
+        """更新vMix文本的专用方法"""
+        params = {
+            "Function": "SetText",
+            "Input": "居中滚动字幕",
+            "SelectedName": "滚动字幕1.Text",
+            "Value": text
+        }
+        try:
+            response = requests.get("http://localhost:8088/api/", params=params, timeout=3)
             if response.status_code == 200:
-                print(f'抽奖飘屏更新：{response.text}')  # 查看 vMix 返回的响应
+                print(f'vMix更新成功: {response.text}')
+        except Exception as e:
+            print(f'vMix API调用失败: {e}')
 
     def toggle_auto_analyze(self):
         """切换自动分析状态"""
@@ -461,35 +499,66 @@ class WebSocketClientApp:
         self.display_message("数据分析", f"显示 {file_type} 记录")
 
     def analyze_data(self):
-        """分析数据并显示结果"""
+        """优化后的数据分析方法"""
         selected_date = self.date_var.get()
         selected_file = self.file_var.get()
 
         if not selected_date or not selected_file or not self.current_records or selected_file not in self.current_records:
-            # messagebox.showwarning("警告", "请先选择日期和文件类型")
             return
 
         records = self.current_records[selected_file]
-        # 清空现有结果
-        for item in self.result_tree.get_children():
-            self.result_tree.delete(item)
-        for line in records:
-            if not line.strip():
-                continue
-            messageType = models.LiveMessageParser.determine_message_type(line)
-            match messageType:
-                case models.LiveMessageParser.MessageType.ARTIFICE:
-                    giftRecord = models.DataAnalyzer.parse_gift_records(line)
-                    self.show_gift_result(giftRecord)
-                case models.LiveMessageParser.MessageType.MULTIPLIER_REWARD:
-                    lotteryRecord = models.DataAnalyzer.parse_lottery_record(line)
-                    self.show_lottery_result(lotteryRecord)
-                case models.LiveMessageParser.MessageType.CHAMELEON_LIFE:
-                    eggRecord = models.DataAnalyzer.parse_egg_record(line)
-                    self.show_egg_results(eggRecord)
 
-        self.result_tree.yview_moveto(1.0)
-        self.filter_treeview()
+        def do_analysis():
+            try:
+                # 在后台线程中解析数据
+                parsed_data = []
+                for line in records:
+                    if not line.strip():
+                        continue
+                    messageType = models.LiveMessageParser.determine_message_type(line)
+                    if messageType == models.LiveMessageParser.MessageType.ARTIFICE:
+                        giftRecord = models.DataAnalyzer.parse_gift_records(line)
+                        if giftRecord:
+                            parsed_data.append((
+                                'gift',
+                                (giftRecord.time, giftRecord.gift_type, giftRecord.user,
+                                 giftRecord.gift, giftRecord.beans, giftRecord.count,
+                                 f"{giftRecord.total:,}", "")
+                            ))
+                    elif messageType == models.LiveMessageParser.MessageType.MULTIPLIER_REWARD:
+                        lotteryRecord = models.DataAnalyzer.parse_lottery_record(line)
+                        if lotteryRecord:
+                            parsed_data.append((
+                                'lottery',
+                                (lotteryRecord.time, lotteryRecord.gift_type, lotteryRecord.user,
+                                 lotteryRecord.gift, lotteryRecord.beans, lotteryRecord.multiple,
+                                 f"{lotteryRecord.beans:,}", "")
+                            ))
+                    elif messageType == models.LiveMessageParser.MessageType.CHAMELEON_LIFE:
+                        eggRecord = models.DataAnalyzer.parse_egg_record(line)
+                        if eggRecord:
+                            parsed_data.append((
+                                'egg',
+                                (eggRecord.time, eggRecord.gift_type, eggRecord.user,
+                                 eggRecord.gift, eggRecord.beans, eggRecord.count,
+                                 f"{eggRecord.beans:,}", f"赠送给 {eggRecord.receiver}")
+                            ))
+
+                # 更新UI
+                def update_ui():
+                    self.result_tree.delete(*self.result_tree.get_children())
+                    for i, (item_type, values) in enumerate(parsed_data):
+                        tags = ('evenrow',) if i % 2 == 0 else ('oddrow',)
+                        self.result_tree.insert("", "end", values=values, tags=tags)
+                    self.result_tree.yview_moveto(1.0)
+                    self.filter_treeview()
+
+                self.safe_ui_update(update_ui)
+
+            except Exception as e:
+                print(f"数据分析出错: {e}")
+
+        self.thread_pool.submit(do_analysis)
 
     def show_gift_result(self, giftRecord):
         """显示礼物结果"""
@@ -502,11 +571,13 @@ class WebSocketClientApp:
                 giftRecord.gift,
                 giftRecord.beans,
                 giftRecord.count,
-                f"{giftRecord.total:,}"
+                f"{giftRecord.total:,}",
+                ""
             ), tags=tags)
 
     def show_lottery_result(self, lotteryRecord):
         if lotteryRecord is not None:
+            tags = ('evenrow',) if len(self.result_tree.get_children()) % 2 == 0 else ('oddrow',)
             self.result_tree.insert('', 'end', values=(
                 lotteryRecord.time,
                 lotteryRecord.gift_type,
@@ -514,10 +585,12 @@ class WebSocketClientApp:
                 lotteryRecord.gift,
                 lotteryRecord.beans,
                 lotteryRecord.multiple,
-                f"{lotteryRecord.beans:,}"
-            ))
+                f"{lotteryRecord.beans:,}",
+                ""
+            ), tags=tags)
 
     def show_egg_results(self, eggRecord):
+        tags = ('evenrow',) if len(self.result_tree.get_children()) % 2 == 0 else ('oddrow',)
         self.result_tree.insert('', 'end', values=(
             eggRecord.time,
             eggRecord.gift_type,
@@ -526,9 +599,8 @@ class WebSocketClientApp:
             eggRecord.beans,
             eggRecord.count,
             f"{eggRecord.beans:,}",
-            f''
             f"赠送给 {eggRecord.receiver}"
-        ))
+        ), tags=tags)
 
     def connect(self):
         if self.connected:
@@ -564,8 +636,8 @@ class WebSocketClientApp:
 
             self.loop.run_forever()
         except Exception as e:
-            self.root.after(0, self.update_status, f"连接错误: {str(e)}")
-            self.root.after(0, self.reset_connection)
+            self.safe_ui_update(self.update_status, f"连接错误: {str(e)}")
+            self.safe_ui_update(self.reset_connection)
         finally:
             if self.loop:
                 self.loop.close()
@@ -627,10 +699,18 @@ class WebSocketClientApp:
         self.connect_btn.config(state=tk.NORMAL)
         self.disconnect_btn.config(state=tk.DISABLED)
         if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.loop.call_soon_threadsafe(self.loop.stop())
+
+    def on_closing(self):
+        """应用关闭时的清理工作"""
+        self.thread_pool.shutdown(wait=False)
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop())
+        self.root.destroy()
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = WebSocketClientApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
