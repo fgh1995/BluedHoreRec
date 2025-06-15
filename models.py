@@ -106,9 +106,9 @@ class DataAnalyzer:
     @classmethod
     def parse_gift_records(cls, line):
 
-        pattern_goldfire = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}) @\(word:(.*?)\) 触发金火时刻！获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
-        pattern_normal = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}) 恭喜 @\(word:(.*?)\) 炼化获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
-        pattern_multiple = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}) 恭喜 @\(word:(.*?)\) 触发(\d+\.?\d*)倍炼化，获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
+        pattern_goldfire = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}(?:\.\d+)?) @\(word:(.*?)\) 触发金火时刻！获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
+        pattern_normal = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}(?:\.\d+)?) 恭喜 @\(word:(.*?)\) 炼化获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
+        pattern_multiple = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}(?:\.\d+)?) 恭喜 @\(word:(.*?)\) 触发(\d+\.?\d*)倍炼化，获得 @\(word:(.*?)\) \((\d+)豆\)x(\d+)'
         # 尝试匹配所有可能的格式
         match = (re.match(pattern_goldfire, line) or
                  re.match(pattern_normal, line) or
@@ -137,7 +137,7 @@ class DataAnalyzer:
     def parse_lottery_record(cls, record):
         # 更严格的正则匹配
         pattern = (
-            r"(?P<time>\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2})\s+"  # 时间
+            r"(?P<time>\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+"  # 时间（支持毫秒）
             r"恭喜@\(word:(?P<user>\w+)\)"  # 用户
             r"触发@\(word:(?P<count>\d+)\)倍，"  # 倍数
             r"获得@\(word:(?P<beans>\d+)\)豆"  # 豆数
@@ -172,7 +172,7 @@ class DataAnalyzer:
 
     @classmethod
     def parse_egg_record(cls, eggRecord):
-        pattern = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}) @\(word:([^)]+)\) 送 @\(word:([^)]+)\) @\(word:(\d+)\) 个 @\(word:<扭蛋礼物>([^)]+)\)，.*'
+        pattern = r'(\d{4}年\d{2}月\d{2}日 \d{2}:\d{2}:\d{2}(?:\.\d+)?) @\(word:([^)]+)\) 送 @\(word:([^)]+)\) @\(word:(\d+)\) 个 @\(word:<扭蛋礼物>([^)]+)\)，.*'
         match = re.match(pattern, eggRecord)
         if match:
             time, user, receiver, count, gift = match.groups()
