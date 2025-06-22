@@ -194,7 +194,7 @@ class WebSocketClientApp:
             # 延迟恢复
             def delayed_reset():
                 time.sleep(7.0)
-                self.thread_pool.submit(update_vmix_text, "欢迎来到水族小宇的直播间")
+                self.thread_pool.submit(update_vmix_text, "欢迎来到夏天的直播间")
 
             self.thread_pool.submit(delayed_reset)
 
